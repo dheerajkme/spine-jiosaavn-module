@@ -9,7 +9,6 @@
 const LOG_PREFIX = '[JioSaavn]';
 const API_BASE = 'https://saavn.sumit.co/api'; 
 
-// Standard browser headers to bypass Cloudflare bot protection
 const REQUEST_HEADERS = {
     'Accept': 'application/json',
     'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
@@ -33,18 +32,31 @@ function normalize(s) {
         .trim();
 }
 
+// Jimmy's Fuzzy Matcher (Handles typos beautifully)
+function similarity(a, b) {
+    a = normalize(a); b = normalize(b);
+    if (!a || !b) return 0;
+    if (a === b) return 1;
+    if (a.length < 2 || b.length < 2) return 0;
+    let bigrams = {};
+    for (let i = 0; i < a.length - 1; i++) {
+        let bg = a.substring(i, i + 2);
+        bigrams[bg] = (bigrams[bg] || 0) + 1;
+    }
+    let hits = 0;
+    for (let j = 0; j < b.length - 1; j++) {
+        let bg2 = b.substring(j, j + 2);
+        if (bigrams[bg2]) { bigrams[bg2]--; hits++; }
+    }
+    return (2 * hits) / (a.length + b.length - 2);
+}
+
 function queryRelevance(query, title, artist) {
     if (!query) return 0;
-    const qTokens = normalize(query).split(' ').filter(t => t.length > 1);
-    if (!qTokens.length) return 0;
-    
-    const hay = normalize((title || '') + ' ' + (artist || ''));
-    let hits = 0;
-    
-    for (let i = 0; i < qTokens.length; i++) {
-        if (hay.includes(qTokens[i])) hits++;
-    }
-    return hits / qTokens.length;
+    const titleSim = similarity(query, title);
+    const combinedSim = similarity(query, title + ' ' + artist);
+    // Return whichever score is higher
+    return Math.max(titleSim, combinedSim);
 }
 
 function canonicityScore(title) {
@@ -52,14 +64,11 @@ function canonicityScore(title) {
     const t = String(title).toLowerCase();
     let score = 1.0;
 
-    // Penalize non-official versions
     if (/\(live[^)]*\)|\[live[^\]]*\]|\blive\b/i.test(t)) score -= 0.40;
     if (/\binstrumental\b|\bkaraoke\b/i.test(t)) score -= 0.50;
     if (/\bcover\b/i.test(t)) score -= 0.35;
     if (/\bslowed\b|\bsped[\s-]?up\b|\bnightcore\b|\breverb\b|\b8d\b/i.test(t)) score -= 0.70;
     if (/\bremix\b|\bmix\b/i.test(t)) score -= 0.10;
-
-    // Boost clean titles without brackets
     if (!/\(.+\)|\s[-\u2013\u2014]\s/.test(t)) score += 0.20;
 
     return Math.max(0.10, Math.min(score, 1.30));
@@ -106,17 +115,16 @@ async function searchTracks(query, limit = 20) {
             const duration = parseInt(song.duration) || 0;
             const compoundId = String(song.id) + '||' + bestAudio;
 
-            // 1. Calculate Strict Scores
             const relevance = queryRelevance(query, title, artistName);
             const canon = canonicityScore(title);
             const sourceRank = Math.max(0, 1 - (index * 0.05)); 
             
-            // 2. Calculate Popularity Score based on playCount (Logarithmic scale)
+            // Popularity Score based on playCount (Logarithmic scale)
             const playCount = parseInt(song.playCount) || parseInt(song.play_count) || 0;
             const popularityScore = Math.min(Math.log10(Math.max(1, playCount)) / 9, 1.0);
             
-            // 3. Final sorting score (Weights: Relevance 50%, Canon 25%, Popularity 15%, Source 10%)
-            const finalScore = (relevance * 0.50) + (canon * 0.25) + (popularityScore * 0.15) + (sourceRank * 0.10);
+            // Final sorting score (Weights: Popularity and Relevance are highest)
+            const finalScore = (relevance * 0.35) + (canon * 0.25) + (popularityScore * 0.30) + (sourceRank * 0.10);
 
             return {
                 id: compoundId,
@@ -126,23 +134,16 @@ async function searchTracks(query, limit = 20) {
                 albumCover: bestImage,
                 duration: duration,
                 audioQuality: 'HIGH',
-                
-                // Keep these internal for sorting, 8SPINE won't render them
-                _relevance: relevance,
                 _score: finalScore
             };
         });
 
-        // Hard Filter: Drop tracks that are highly irrelevant to the search
-        tracks = tracks.filter(t => t._relevance > 0.15);
-        
-        // Hard Filter: Drop crazy durations (likely podcasts or 10-hour mixes)
+        // We REMOVED the hard filter. We never delete tracks now, we just sort them.
         tracks = tracks.filter(t => t.duration > 30 && t.duration < 1200);
 
         // Sort by our strict scoring algorithm
         tracks.sort((a, b) => b._score - a._score);
 
-        // Return the top results up to the limit
         const finalTracks = tracks.slice(0, limit);
 
         return { tracks: finalTracks, total: finalTracks.length };
@@ -176,9 +177,7 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
         }
 
         if (directUrl) {
-            // Force HTTPS to bypass Apple AVPlayer restrictions
             directUrl = directUrl.replace('http://', 'https://');
-            
             return {
                 streamUrl: directUrl,
                 streamType: 'mp4',
@@ -204,7 +203,7 @@ return {
     id: 'jiosaavn',
     name: 'JioSaavn',
     author: 'community',
-    version: '1.0.5',
+    version: '1.0.6',
     labels: ['JioSaavn', 'Bollywood', 'Audio'],
     description: 'Stream from JioSaavn via public API with smart sorting.',
     logo: 'https://upload.wikimedia.org/wikipedia/commons/3/35/JioSaavn-logo.png',
