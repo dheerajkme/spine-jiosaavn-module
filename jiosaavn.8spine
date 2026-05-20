@@ -9,31 +9,21 @@
 const LOG_PREFIX = '[JioSaavn]';
 const API_BASE = 'https://saavn.sumit.co/api'; 
 
-// Standard browser headers to bypass Cloudflare bot protection
 const REQUEST_HEADERS = {
     'Accept': 'application/json',
     'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
 };
 
 // ---------------------------------------------------------------------------
-// Strict Matching Helpers
+// Matcher Helpers
 // ---------------------------------------------------------------------------
-
 function normalize(s) {
     if (!s) return '';
     let out = String(s).toLowerCase();
-    if (typeof out.normalize === 'function') {
-        out = out.normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
-    }
-    return out
-        .replace(/\([^)]*\)|\[[^\]]*\]/g, ' ')
-        .replace(/feat\.?|featuring|ft\.?|with\s+/gi, ' ')
-        .replace(/[^\w\s]/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
+    if (typeof out.normalize === 'function') out = out.normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
+    return out.replace(/\([^)]*\)|\[[^\]]*\]/g, ' ').replace(/feat\.?|featuring|ft\.?|with\s+/gi, ' ').replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-// Jimmy's Fuzzy Matcher
 function similarity(a, b) {
     a = normalize(a); b = normalize(b);
     if (!a || !b) return 0;
@@ -52,34 +42,18 @@ function similarity(a, b) {
     return (2 * hits) / (a.length + b.length - 2);
 }
 
-// Jimmy's Token-Based Relevance Matcher
 function queryRelevance(query, title, artist, album) {
     if (!query) return 0;
-    
-    // Break the user's search into individual words (tokens)
     const qTokens = normalize(query).split(' ').filter(t => t.length > 1);
     if (!qTokens.length) return 0;
     
-    // Create a giant string of everything we know about this song
     const hay = normalize((title || '') + ' ' + (artist || '') + ' ' + (album || ''));
-    
-    // Count how many of the user's words appear ANYWHERE in the song data
     let hits = 0;
-    for (let i = 0; i < qTokens.length; i++) {
-        if (hay.includes(qTokens[i])) hits++;
-    }
+    for (let i = 0; i < qTokens.length; i++) if (hay.includes(qTokens[i])) hits++;
     
-    // Base score is percentage of words found (e.g. 2 of 2 = 1.0)
     let base = hits / qTokens.length;
-    
-    // BOOST 1: If they explicitly searched the Artist's name (e.g. typed exactly "Arijit Singh")
-    const artistSim = similarity(query, normalize(artist || ''));
-    if (artistSim > 0.80) base = Math.min(1.3, base + 0.30);
-    
-    // BOOST 2: If they explicitly searched the Title (e.g. typed exactly "Kesariya")
-    const titleSim = similarity(query, normalize(title || ''));
-    if (titleSim > 0.80) base = Math.min(1.3, base + 0.30);
-    
+    if (similarity(query, normalize(artist || '')) > 0.80) base = Math.min(1.3, base + 0.30);
+    if (similarity(query, normalize(title || '')) > 0.80) base = Math.min(1.3, base + 0.30);
     return base;
 }
 
@@ -87,27 +61,66 @@ function canonicityScore(title) {
     if (!title) return 1.0;
     const t = String(title).toLowerCase();
     let score = 1.0;
-
     if (/\(live[^)]*\)|\[live[^\]]*\]|\blive\b/i.test(t)) score -= 0.40;
     if (/\binstrumental\b|\bkaraoke\b/i.test(t)) score -= 0.50;
     if (/\bcover\b/i.test(t)) score -= 0.35;
     if (/\bslowed\b|\bsped[\s-]?up\b|\bnightcore\b|\breverb\b|\b8d\b/i.test(t)) score -= 0.70;
     if (/\bremix\b|\bmix\b/i.test(t)) score -= 0.10;
     if (!/\(.+\)|\s[-\u2013\u2014]\s/.test(t)) score += 0.20;
-
     return Math.max(0.10, Math.min(score, 1.30));
 }
 
 // ---------------------------------------------------------------------------
-// Search
+// Main Mappers
+// ---------------------------------------------------------------------------
+function extractBestImage(imageArray) {
+    if (Array.isArray(imageArray) && imageArray.length > 0) return imageArray[imageArray.length - 1].url || imageArray[imageArray.length - 1].link || '';
+    if (typeof imageArray === 'string') return imageArray;
+    return '';
+}
+
+function mapTrack(song) {
+    const bestImage = extractBestImage(song.image);
+    let bestAudio = '';
+    if (Array.isArray(song.downloadUrl) && song.downloadUrl.length > 0) {
+        bestAudio = song.downloadUrl[song.downloadUrl.length - 1].url || song.downloadUrl[song.downloadUrl.length - 1].link || '';
+    }
+
+    let artistName = 'Unknown Artist';
+    let artistId = null;
+    if (typeof song.primaryArtists === 'string') {
+        artistName = song.primaryArtists;
+    } else if (Array.isArray(song.primaryArtists)) {
+        artistName = song.primaryArtists.map(a => a.name).join(', ');
+        if (song.primaryArtists.length > 0) artistId = String(song.primaryArtists[0].id);
+    }
+
+    const title = song.name || song.title || 'Unknown Title';
+    const albumName = (song.album && song.album.name) ? song.album.name : 'Unknown Album';
+    const albumId = (song.album && song.album.id) ? String(song.album.id) : null;
+    const compoundId = String(song.id) + '||' + bestAudio;
+
+    return {
+        id: compoundId,
+        title: title,
+        artist: artistName,
+        artistId: artistId,
+        album: albumName,
+        albumId: albumId,
+        albumCover: bestImage,
+        duration: parseInt(song.duration) || 0,
+        audioQuality: 'HIGH',
+        _playCount: parseInt(song.playCount) || parseInt(song.play_count) || 0
+    };
+}
+
+// ---------------------------------------------------------------------------
+// 8SPINE Core Functions
 // ---------------------------------------------------------------------------
 
 async function searchTracks(query, limit = 20) {
     try {
-        const response = await fetch(`${API_BASE}/search/songs?query=${encodeURIComponent(query)}&limit=${limit * 2}`, {
-            headers: REQUEST_HEADERS
-        });
-        
+        const response = await fetch(`${API_BASE}/search/songs?query=${encodeURIComponent(query)}&limit=${limit * 2}`, { headers: REQUEST_HEADERS });
         if (!response.ok) return { tracks: [], total: 0 };
         const json = await response.json();
         if (!json.success || !json.data) return { tracks: [], total: 0 };
@@ -116,52 +129,14 @@ async function searchTracks(query, limit = 20) {
         if (!Array.isArray(rawResults) || rawResults.length === 0) return { tracks: [], total: 0 };
 
         let tracks = rawResults.map((song, index) => {
-            let bestImage = '';
-            if (Array.isArray(song.image) && song.image.length > 0) {
-                bestImage = song.image[song.image.length - 1].url || song.image[song.image.length - 1].link || '';
-            } else if (typeof song.image === 'string') {
-                bestImage = song.image;
-            }
-            
-            let bestAudio = '';
-            if (Array.isArray(song.downloadUrl) && song.downloadUrl.length > 0) {
-                bestAudio = song.downloadUrl[song.downloadUrl.length - 1].url || song.downloadUrl[song.downloadUrl.length - 1].link || '';
-            }
-
-            let artistName = 'Unknown Artist';
-            if (typeof song.primaryArtists === 'string') {
-                artistName = song.primaryArtists;
-            } else if (Array.isArray(song.primaryArtists)) {
-                artistName = song.primaryArtists.map(a => a.name).join(', ');
-            }
-
-            const title = song.name || song.title || 'Unknown Title';
-            const albumName = (song.album && song.album.name) ? song.album.name : 'Unknown Album';
-            const duration = parseInt(song.duration) || 0;
-            const compoundId = String(song.id) + '||' + bestAudio;
-
-            // Strict Scores (Now uses Jimmy's Artist/Album matching logic)
-            const relevance = queryRelevance(query, title, artistName, albumName);
-            const canon = canonicityScore(title);
+            const mapped = mapTrack(song);
+            const relevance = queryRelevance(query, mapped.title, mapped.artist, mapped.album);
+            const canon = canonicityScore(mapped.title);
             const sourceRank = Math.max(0, 1 - (index * 0.05)); 
+            const popularityScore = Math.min(Math.log10(Math.max(1, mapped._playCount)) / 9, 1.0);
             
-            // Popularity Score based on playCount (Logarithmic scale)
-            const playCount = parseInt(song.playCount) || parseInt(song.play_count) || 0;
-            const popularityScore = Math.min(Math.log10(Math.max(1, playCount)) / 9, 1.0);
-            
-            // Final sorting score weights
-            const finalScore = (relevance * 0.45) + (canon * 0.25) + (popularityScore * 0.20) + (sourceRank * 0.10);
-
-            return {
-                id: compoundId,
-                title: title,
-                artist: artistName,
-                album: albumName,
-                albumCover: bestImage,
-                duration: duration,
-                audioQuality: 'HIGH',
-                _score: finalScore
-            };
+            mapped._score = (relevance * 0.45) + (canon * 0.25) + (popularityScore * 0.20) + (sourceRank * 0.10);
+            return mapped;
         });
 
         tracks = tracks.filter(t => t.duration > 30 && t.duration < 1200);
@@ -170,14 +145,9 @@ async function searchTracks(query, limit = 20) {
         const finalTracks = tracks.slice(0, limit);
         return { tracks: finalTracks, total: finalTracks.length };
     } catch (error) {
-        console.warn(LOG_PREFIX, 'Search error:', error);
         return { tracks: [], total: 0 };
     }
 }
-
-// ---------------------------------------------------------------------------
-// Player Stream
-// ---------------------------------------------------------------------------
 
 async function getTrackStreamUrl(trackId, preferredQuality, context) {
     try {
@@ -187,34 +157,94 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
 
         if (!directUrl || directUrl === 'undefined' || directUrl === '') {
             const response = await fetch(`${API_BASE}/songs?id=${realId}`, { headers: REQUEST_HEADERS });
-            if (!response.ok) throw new Error('HTTP ' + response.status);
-            
             const json = await response.json();
-            if (json.success && json.data && json.data[0]) {
-                const song = json.data[0];
-                if (song.downloadUrl && song.downloadUrl.length > 0) {
-                    directUrl = song.downloadUrl[song.downloadUrl.length - 1].url || song.downloadUrl[song.downloadUrl.length - 1].link;
-                }
+            if (json.success && json.data && json.data[0] && json.data[0].downloadUrl) {
+                const arr = json.data[0].downloadUrl;
+                directUrl = arr[arr.length - 1].url || arr[arr.length - 1].link;
             }
         }
 
         if (directUrl) {
-            directUrl = directUrl.replace('http://', 'https://');
             return {
-                streamUrl: directUrl,
+                streamUrl: directUrl.replace('http://', 'https://'),
                 streamType: 'mp4',
                 track: { id: realId, audioQuality: 'HIGH' }
             };
         }
         throw new Error('No audio URL found');
     } catch (error) {
-        console.warn(LOG_PREFIX, 'Stream error:', error);
         throw error;
     }
 }
 
 async function getAlbum(albumId) {
-    throw new Error('Album fetch not supported yet');
+    try {
+        const response = await fetch(`${API_BASE}/albums?id=${albumId}`, { headers: REQUEST_HEADERS });
+        if (!response.ok) return null;
+        const json = await response.json();
+        
+        if (json.success && json.data) {
+            const albumData = json.data;
+            const tracks = (albumData.songs || []).map(song => mapTrack(song));
+            return {
+                album: { 
+                    id: String(albumData.id), 
+                    title: albumData.name || 'Unknown', 
+                    artist: albumData.primaryArtists || 'Unknown', 
+                    albumCover: extractBestImage(albumData.image) 
+                },
+                tracks: tracks
+            };
+        }
+        return null;
+    } catch (e) {
+        return null;
+    }
+}
+
+async function getArtist(artistId) {
+    try {
+        const response = await fetch(`${API_BASE}/artists?id=${artistId}`, { headers: REQUEST_HEADERS });
+        if (!response.ok) return null;
+        const json = await response.json();
+        
+        if (json.success && json.data) {
+            const artistData = json.data;
+            const topTracks = (artistData.topSongs || []).map(song => mapTrack(song));
+            return {
+                id: String(artistData.id),
+                name: artistData.name || 'Unknown',
+                picture: extractBestImage(artistData.image),
+                topTracks: topTracks,
+                albums: [] 
+            };
+        }
+        return null;
+    } catch (e) {
+        return null;
+    }
+}
+
+async function getLyrics(trackId) {
+    try {
+        const realId = String(trackId).split('||')[0];
+        const response = await fetch(`${API_BASE}/songs?id=${realId}&lyrics=true`, { headers: REQUEST_HEADERS });
+        const json = await response.json();
+        
+        if (json.success && json.data && json.data[0]) {
+            // Check if JioSaavn returned lyrics natively
+            if (json.data[0].hasLyrics && json.data[0].lyrics) {
+                return {
+                    plain: json.data[0].lyrics,
+                    synced: null, // JioSaavn usually only provides plain text lyrics
+                    source: 'JioSaavn'
+                };
+            }
+        }
+        return null;
+    } catch (e) {
+        return null;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -225,9 +255,9 @@ return {
     id: 'jiosaavn',
     name: 'JioSaavn',
     author: 'community',
-    version: '1.0.7',
-    labels: ['JioSaavn', 'Bollywood', 'Audio'],
-    description: 'Stream from JioSaavn via public API with smart sorting.',
+    version: '1.0.8',
+    labels: ['JioSaavn', 'Bollywood', 'Lyrics', 'Albums'],
+    description: 'Stream from JioSaavn with strict matching, full albums, and native lyrics.',
     logo: 'https://upload.wikimedia.org/wikipedia/commons/3/35/JioSaavn-logo.png',
 
     settings: {
@@ -244,5 +274,7 @@ return {
 
     searchTracks: searchTracks,
     getTrackStreamUrl: getTrackStreamUrl,
-    getAlbum: getAlbum
+    getAlbum: getAlbum,
+    getArtist: getArtist,
+    getLyrics: getLyrics
 };
