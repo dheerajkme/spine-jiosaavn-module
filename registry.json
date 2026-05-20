@@ -9,7 +9,7 @@
       "description": "Stream from JioSaavn via custom API.",
       "logo": "https://upload.wikimedia.org/wikipedia/commons/3/35/JioSaavn-logo.png",
       "labels": ["JioSaavn", "Bollywood", "Audio"],
-      "url": "https://your-github-username.github.io/repo-name/jiosaavn.js"
+      "url": "https://dheerajkme.github.io/spine-jiosaavn-module/jiosaavn.js"
     }
   ]
 }
