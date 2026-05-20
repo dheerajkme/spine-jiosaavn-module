@@ -7,7 +7,8 @@
  */
 
 const LOG_PREFIX = '[JioSaavn]';
-const API_BASE = 'https://saavn.sumit.co/api'; 
+// Using the new Vercel deployment endpoint
+const API_BASE = 'https://saavnapi-nine.vercel.app'; 
 
 const REQUEST_HEADERS = {
     'Accept': 'application/json',
@@ -15,7 +16,7 @@ const REQUEST_HEADERS = {
 };
 
 // ---------------------------------------------------------------------------
-// Matcher Helpers
+// Matcher Helpers (Retained for future use)
 // ---------------------------------------------------------------------------
 function normalize(s) {
     if (!s) return '';
@@ -46,19 +47,11 @@ function queryRelevance(query, title, artist, album) {
     if (!query) return 0;
     const qTokens = normalize(query).split(' ').filter(t => t.length > 1);
     if (!qTokens.length) return 0;
-    
     const hay = normalize((title || '') + ' ' + (artist || '') + ' ' + (album || ''));
     let hits = 0;
     for (let i = 0; i < qTokens.length; i++) if (hay.includes(qTokens[i])) hits++;
-    
     let base = hits / qTokens.length;
-    
-    // CRITICAL PENALTY: If words from the search are missing, tank the score 
-    // so massive play counts cannot force wrong songs to the top.
-    if (hits < qTokens.length) {
-        base = base * 0.3; 
-    }
-
+    if (hits < qTokens.length) base = base * 0.3; 
     if (similarity(query, normalize(artist || '')) > 0.80) base = Math.min(1.3, base + 0.30);
     if (similarity(query, normalize(title || '')) > 0.80) base = Math.min(1.3, base + 0.30);
     return base;
@@ -80,15 +73,16 @@ function canonicityScore(title) {
 // ---------------------------------------------------------------------------
 // Main Mappers
 // ---------------------------------------------------------------------------
-function extractBestImage(imageArray) {
-    if (Array.isArray(imageArray) && imageArray.length > 0) return imageArray[imageArray.length - 1].url || imageArray[imageArray.length - 1].link || '';
-    if (typeof imageArray === 'string') return imageArray;
+function extractBestImage(imageObj) {
+    if (Array.isArray(imageObj) && imageObj.length > 0) return imageObj[imageObj.length - 1].url || imageObj[imageObj.length - 1].link || '';
+    if (typeof imageObj === 'string') return imageObj;
     return '';
 }
 
 function mapTrack(song) {
-    const bestImage = extractBestImage(song.image);
-    let bestAudio = '';
+    const bestImage = extractBestImage(song.image || song.image_url);
+    
+    let bestAudio = song.media_url || song.url || '';
     if (Array.isArray(song.downloadUrl) && song.downloadUrl.length > 0) {
         bestAudio = song.downloadUrl[song.downloadUrl.length - 1].url || song.downloadUrl[song.downloadUrl.length - 1].link || '';
     }
@@ -96,8 +90,9 @@ function mapTrack(song) {
     let artistName = 'Unknown Artist';
     let artistId = null;
 
-    // CRITICAL FIX: Correctly parse the nested API structure
-    if (song.artists && Array.isArray(song.artists.primary) && song.artists.primary.length > 0) {
+    if (song.primary_artists) {
+        artistName = song.primary_artists;
+    } else if (song.artists && Array.isArray(song.artists.primary) && song.artists.primary.length > 0) {
         artistName = song.artists.primary.map(a => a.name).join(', ');
         artistId = String(song.artists.primary[0].id);
     } else if (typeof song.primaryArtists === 'string') {
@@ -107,10 +102,13 @@ function mapTrack(song) {
         if (song.primaryArtists.length > 0) artistId = String(song.primaryArtists[0].id);
     }
 
-    const title = song.name || song.title || 'Unknown Title';
-    const albumName = (song.album && song.album.name) ? song.album.name : 'Unknown Album';
+    const title = song.song || song.name || song.title || 'Unknown Title';
+    const albumName = (song.album && song.album.name) ? song.album.name : (typeof song.album === 'string' ? song.album : 'Unknown Album');
     const albumId = (song.album && song.album.id) ? String(song.album.id) : null;
-    const compoundId = String(song.id) + '||' + bestAudio;
+    
+    // Perma URL is usually best for Sumanjay fork stream resolving
+    const rawId = song.perma_url || song.id || song.songid;
+    const compoundId = String(rawId) + '||' + bestAudio;
 
     return {
         id: compoundId,
@@ -122,7 +120,7 @@ function mapTrack(song) {
         albumCover: bestImage,
         duration: parseInt(song.duration) || 0,
         audioQuality: 'HIGH',
-        _playCount: parseInt(song.playCount) || parseInt(song.play_count) || 0
+        _playCount: parseInt(song.play_count) || parseInt(song.playCount) || 0
     };
 }
 
@@ -132,32 +130,51 @@ function mapTrack(song) {
 
 async function searchTracks(query, limit = 20) {
     try {
-        const response = await fetch(`${API_BASE}/search/songs?query=${encodeURIComponent(query)}&limit=${limit * 2}`, { headers: REQUEST_HEADERS });
+        // Switched endpoint to /result/?query=
+        const response = await fetch(`${API_BASE}/result/?query=${encodeURIComponent(query)}&limit=${limit}`, { headers: REQUEST_HEADERS });
         if (!response.ok) return { tracks: [], total: 0 };
+        
         const json = await response.json();
-        if (!json.success || !json.data) return { tracks: [], total: 0 };
+        
+        // Accept both response shapes
+        let rawResults = [];
+        if (Array.isArray(json)) {
+            rawResults = json;
+        } else if (json.success && json.data) {
+            rawResults = json.data.results || json.data.songs || json.data || [];
+        } else {
+            rawResults = json.songs || json.results || [];
+        }
 
-        const rawResults = json.data.results || json.data.songs || json.data || [];
         if (!Array.isArray(rawResults) || rawResults.length === 0) return { tracks: [], total: 0 };
 
         let tracks = rawResults.map((song, index) => {
             const mapped = mapTrack(song);
+            
+            // Keep scoring calculations in memory just in case
             const relevance = queryRelevance(query, mapped.title, mapped.artist, mapped.album);
             const canon = canonicityScore(mapped.title);
             const sourceRank = Math.max(0, 1 - (index * 0.05)); 
             const popularityScore = Math.min(Math.log10(Math.max(1, mapped._playCount)) / 9, 1.0);
-            
             mapped._score = (relevance * 0.45) + (canon * 0.25) + (popularityScore * 0.20) + (sourceRank * 0.10);
+            
             return mapped;
         });
 
+        /*
+        // ---------------------------------------------------------
+        // COMMENTED OUT: Strict duration filter and custom ranking
+        // We will trust the API's default ranking for now.
+        // ---------------------------------------------------------
         tracks = tracks.filter(t => t.duration > 30 && t.duration < 1200);
         tracks.sort((a, b) => b._score - a._score);
+        */
 
         const finalTracks = tracks.slice(0, limit);
         return { tracks: finalTracks, total: finalTracks.length };
     } catch (error) {
-        return { tracks: [], total: 0 };
+        console.warn(LOG_PREFIX, 'Search error:', error);
+        return { tracks: [{ id: 'err', title: `Error: ${error.message}`, artist: 'Try again', duration: 0, audioQuality: 'HIGH' }], total: 1 };
     }
 }
 
@@ -168,11 +185,18 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
         let directUrl = parts.length > 1 ? parts[1] : null;
 
         if (!directUrl || directUrl === 'undefined' || directUrl === '') {
-            const response = await fetch(`${API_BASE}/songs?id=${realId}`, { headers: REQUEST_HEADERS });
+            // Sumanjay API uses /song/?query= to resolve tracks
+            const response = await fetch(`${API_BASE}/song/?query=${encodeURIComponent(realId)}`, { headers: REQUEST_HEADERS });
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+            
             const json = await response.json();
-            if (json.success && json.data && json.data[0] && json.data[0].downloadUrl) {
-                const arr = json.data[0].downloadUrl;
-                directUrl = arr[arr.length - 1].url || arr[arr.length - 1].link;
+            const songData = Array.isArray(json) ? json[0] : json;
+            
+            if (songData) {
+                directUrl = songData.media_url || songData.url || '';
+                if (!directUrl && Array.isArray(songData.downloadUrl)) {
+                    directUrl = songData.downloadUrl[songData.downloadUrl.length - 1].url || songData.downloadUrl[songData.downloadUrl.length - 1].link;
+                }
             }
         }
 
@@ -190,72 +214,16 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
 }
 
 async function getAlbum(albumId) {
-    try {
-        const response = await fetch(`${API_BASE}/albums?id=${albumId}`, { headers: REQUEST_HEADERS });
-        if (!response.ok) return null;
-        const json = await response.json();
-        
-        if (json.success && json.data) {
-            const albumData = json.data;
-            const tracks = (albumData.songs || []).map(song => mapTrack(song));
-            return {
-                album: { 
-                    id: String(albumData.id), 
-                    title: albumData.name || 'Unknown', 
-                    artist: albumData.primaryArtists || 'Unknown', 
-                    albumCover: extractBestImage(albumData.image) 
-                },
-                tracks: tracks
-            };
-        }
-        return null;
-    } catch (e) {
-        return null;
-    }
+    // Left empty/unsupported as /result/ forks often handle albums differently
+    throw new Error('Album fetch not supported yet');
 }
 
 async function getArtist(artistId) {
-    try {
-        const response = await fetch(`${API_BASE}/artists?id=${artistId}`, { headers: REQUEST_HEADERS });
-        if (!response.ok) return null;
-        const json = await response.json();
-        
-        if (json.success && json.data) {
-            const artistData = json.data;
-            const topTracks = (artistData.topSongs || []).map(song => mapTrack(song));
-            return {
-                id: String(artistData.id),
-                name: artistData.name || 'Unknown',
-                picture: extractBestImage(artistData.image),
-                topTracks: topTracks,
-                albums: [] 
-            };
-        }
-        return null;
-    } catch (e) {
-        return null;
-    }
+    throw new Error('Artist fetch not supported yet');
 }
 
 async function getLyrics(trackId) {
-    try {
-        const realId = String(trackId).split('||')[0];
-        const response = await fetch(`${API_BASE}/songs?id=${realId}&lyrics=true`, { headers: REQUEST_HEADERS });
-        const json = await response.json();
-        
-        if (json.success && json.data && json.data[0]) {
-            if (json.data[0].hasLyrics && json.data[0].lyrics) {
-                return {
-                    plain: json.data[0].lyrics,
-                    synced: null, 
-                    source: 'JioSaavn'
-                };
-            }
-        }
-        return null;
-    } catch (e) {
-        return null;
-    }
+    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -263,12 +231,12 @@ async function getLyrics(trackId) {
 // ---------------------------------------------------------------------------
 
 return {
-    id: 'jiosaavn',
+    id: 'jiosaavn-vercel',
     name: 'JioSaavn',
     author: 'community',
-    version: '1.0.9',
-    labels: ['JioSaavn', 'Bollywood', 'Lyrics', 'Albums'],
-    description: 'Stream from JioSaavn with strict matching, full albums, and native lyrics.',
+    version: '1.1.0',
+    labels: ['JioSaavn', 'Bollywood', 'Vercel API'],
+    description: 'Stream from JioSaavn via direct API ordering.',
     logo: 'https://upload.wikimedia.org/wikipedia/commons/3/35/JioSaavn-logo.png',
 
     settings: {
