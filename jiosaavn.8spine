@@ -52,6 +52,13 @@ function queryRelevance(query, title, artist, album) {
     for (let i = 0; i < qTokens.length; i++) if (hay.includes(qTokens[i])) hits++;
     
     let base = hits / qTokens.length;
+    
+    // CRITICAL PENALTY: If words from the search are missing, tank the score 
+    // so massive play counts cannot force wrong songs to the top.
+    if (hits < qTokens.length) {
+        base = base * 0.3; 
+    }
+
     if (similarity(query, normalize(artist || '')) > 0.80) base = Math.min(1.3, base + 0.30);
     if (similarity(query, normalize(title || '')) > 0.80) base = Math.min(1.3, base + 0.30);
     return base;
@@ -88,7 +95,12 @@ function mapTrack(song) {
 
     let artistName = 'Unknown Artist';
     let artistId = null;
-    if (typeof song.primaryArtists === 'string') {
+
+    // CRITICAL FIX: Correctly parse the nested API structure
+    if (song.artists && Array.isArray(song.artists.primary) && song.artists.primary.length > 0) {
+        artistName = song.artists.primary.map(a => a.name).join(', ');
+        artistId = String(song.artists.primary[0].id);
+    } else if (typeof song.primaryArtists === 'string') {
         artistName = song.primaryArtists;
     } else if (Array.isArray(song.primaryArtists)) {
         artistName = song.primaryArtists.map(a => a.name).join(', ');
@@ -232,11 +244,10 @@ async function getLyrics(trackId) {
         const json = await response.json();
         
         if (json.success && json.data && json.data[0]) {
-            // Check if JioSaavn returned lyrics natively
             if (json.data[0].hasLyrics && json.data[0].lyrics) {
                 return {
                     plain: json.data[0].lyrics,
-                    synced: null, // JioSaavn usually only provides plain text lyrics
+                    synced: null, 
                     source: 'JioSaavn'
                 };
             }
@@ -255,7 +266,7 @@ return {
     id: 'jiosaavn',
     name: 'JioSaavn',
     author: 'community',
-    version: '1.0.8',
+    version: '1.0.9',
     labels: ['JioSaavn', 'Bollywood', 'Lyrics', 'Albums'],
     description: 'Stream from JioSaavn with strict matching, full albums, and native lyrics.',
     logo: 'https://upload.wikimedia.org/wikipedia/commons/3/35/JioSaavn-logo.png',
