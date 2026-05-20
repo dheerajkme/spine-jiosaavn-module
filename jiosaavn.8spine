@@ -9,6 +9,7 @@
 const LOG_PREFIX = '[JioSaavn]';
 const API_BASE = 'https://saavn.sumit.co/api'; 
 
+// Standard browser headers to bypass Cloudflare bot protection
 const REQUEST_HEADERS = {
     'Accept': 'application/json',
     'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
@@ -32,7 +33,7 @@ function normalize(s) {
         .trim();
 }
 
-// Jimmy's Fuzzy Matcher (Handles typos beautifully)
+// Jimmy's Fuzzy Matcher
 function similarity(a, b) {
     a = normalize(a); b = normalize(b);
     if (!a || !b) return 0;
@@ -51,12 +52,35 @@ function similarity(a, b) {
     return (2 * hits) / (a.length + b.length - 2);
 }
 
-function queryRelevance(query, title, artist) {
+// Jimmy's Token-Based Relevance Matcher
+function queryRelevance(query, title, artist, album) {
     if (!query) return 0;
-    const titleSim = similarity(query, title);
-    const combinedSim = similarity(query, title + ' ' + artist);
-    // Return whichever score is higher
-    return Math.max(titleSim, combinedSim);
+    
+    // Break the user's search into individual words (tokens)
+    const qTokens = normalize(query).split(' ').filter(t => t.length > 1);
+    if (!qTokens.length) return 0;
+    
+    // Create a giant string of everything we know about this song
+    const hay = normalize((title || '') + ' ' + (artist || '') + ' ' + (album || ''));
+    
+    // Count how many of the user's words appear ANYWHERE in the song data
+    let hits = 0;
+    for (let i = 0; i < qTokens.length; i++) {
+        if (hay.includes(qTokens[i])) hits++;
+    }
+    
+    // Base score is percentage of words found (e.g. 2 of 2 = 1.0)
+    let base = hits / qTokens.length;
+    
+    // BOOST 1: If they explicitly searched the Artist's name (e.g. typed exactly "Arijit Singh")
+    const artistSim = similarity(query, normalize(artist || ''));
+    if (artistSim > 0.80) base = Math.min(1.3, base + 0.30);
+    
+    // BOOST 2: If they explicitly searched the Title (e.g. typed exactly "Kesariya")
+    const titleSim = similarity(query, normalize(title || ''));
+    if (titleSim > 0.80) base = Math.min(1.3, base + 0.30);
+    
+    return base;
 }
 
 function canonicityScore(title) {
@@ -112,10 +136,12 @@ async function searchTracks(query, limit = 20) {
             }
 
             const title = song.name || song.title || 'Unknown Title';
+            const albumName = (song.album && song.album.name) ? song.album.name : 'Unknown Album';
             const duration = parseInt(song.duration) || 0;
             const compoundId = String(song.id) + '||' + bestAudio;
 
-            const relevance = queryRelevance(query, title, artistName);
+            // Strict Scores (Now uses Jimmy's Artist/Album matching logic)
+            const relevance = queryRelevance(query, title, artistName, albumName);
             const canon = canonicityScore(title);
             const sourceRank = Math.max(0, 1 - (index * 0.05)); 
             
@@ -123,14 +149,14 @@ async function searchTracks(query, limit = 20) {
             const playCount = parseInt(song.playCount) || parseInt(song.play_count) || 0;
             const popularityScore = Math.min(Math.log10(Math.max(1, playCount)) / 9, 1.0);
             
-            // Final sorting score (Weights: Popularity and Relevance are highest)
-            const finalScore = (relevance * 0.35) + (canon * 0.25) + (popularityScore * 0.30) + (sourceRank * 0.10);
+            // Final sorting score weights
+            const finalScore = (relevance * 0.45) + (canon * 0.25) + (popularityScore * 0.20) + (sourceRank * 0.10);
 
             return {
                 id: compoundId,
                 title: title,
                 artist: artistName,
-                album: (song.album && song.album.name) ? song.album.name : 'Unknown Album',
+                album: albumName,
                 albumCover: bestImage,
                 duration: duration,
                 audioQuality: 'HIGH',
@@ -138,14 +164,10 @@ async function searchTracks(query, limit = 20) {
             };
         });
 
-        // We REMOVED the hard filter. We never delete tracks now, we just sort them.
         tracks = tracks.filter(t => t.duration > 30 && t.duration < 1200);
-
-        // Sort by our strict scoring algorithm
         tracks.sort((a, b) => b._score - a._score);
 
         const finalTracks = tracks.slice(0, limit);
-
         return { tracks: finalTracks, total: finalTracks.length };
     } catch (error) {
         console.warn(LOG_PREFIX, 'Search error:', error);
@@ -203,7 +225,7 @@ return {
     id: 'jiosaavn',
     name: 'JioSaavn',
     author: 'community',
-    version: '1.0.6',
+    version: '1.0.7',
     labels: ['JioSaavn', 'Bollywood', 'Audio'],
     description: 'Stream from JioSaavn via public API with smart sorting.',
     logo: 'https://upload.wikimedia.org/wikipedia/commons/3/35/JioSaavn-logo.png',
