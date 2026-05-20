@@ -1,3 +1,12 @@
+/* @8spine-meta
+ * type: MODULE
+ * category: music
+ * featured: false
+ * trusted: true
+ * nsfw: false
+ */
+ 
+
 const LOG_PREFIX = '[JioSaavn]';
 
 // ⚠️ REPLACE THIS with your actual hosted JioSaavn API URL
