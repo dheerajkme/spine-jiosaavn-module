@@ -9,47 +9,79 @@
 const LOG_PREFIX = '[JioSaavn]';
 const API_BASE = 'https://saavn.sumit.co/api'; 
 
-// Standard browser headers to bypass Cloudflare bot protection
 const REQUEST_HEADERS = {
     'Accept': 'application/json',
     'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
 };
 
+// ---------------------------------------------------------------------------
+// Strict Matching Helpers
+// ---------------------------------------------------------------------------
+
+function normalize(s) {
+    if (!s) return '';
+    let out = String(s).toLowerCase();
+    if (typeof out.normalize === 'function') {
+        out = out.normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
+    }
+    return out
+        .replace(/\([^)]*\)|\[[^\]]*\]/g, ' ')
+        .replace(/feat\.?|featuring|ft\.?|with\s+/gi, ' ')
+        .replace(/[^\w\s]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function queryRelevance(query, title, artist) {
+    if (!query) return 0;
+    const qTokens = normalize(query).split(' ').filter(t => t.length > 1);
+    if (!qTokens.length) return 0;
+    
+    const hay = normalize((title || '') + ' ' + (artist || ''));
+    let hits = 0;
+    
+    for (let i = 0; i < qTokens.length; i++) {
+        if (hay.includes(qTokens[i])) hits++;
+    }
+    return hits / qTokens.length;
+}
+
+function canonicityScore(title) {
+    if (!title) return 1.0;
+    const t = String(title).toLowerCase();
+    let score = 1.0;
+
+    // Penalize non-official versions
+    if (/\(live[^)]*\)|\[live[^\]]*\]|\blive\b/i.test(t)) score -= 0.40;
+    if (/\binstrumental\b|\bkaraoke\b/i.test(t)) score -= 0.50;
+    if (/\bcover\b/i.test(t)) score -= 0.35;
+    if (/\bslowed\b|\bsped[\s-]?up\b|\bnightcore\b|\breverb\b|\b8d\b/i.test(t)) score -= 0.70;
+    if (/\bremix\b|\bmix\b/i.test(t)) score -= 0.10;
+
+    // Boost clean titles without brackets
+    if (!/\(.+\)|\s[-\u2013\u2014]\s/.test(t)) score += 0.20;
+
+    return Math.max(0.10, Math.min(score, 1.30));
+}
+
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+
 async function searchTracks(query, limit = 20) {
     try {
-        const response = await fetch(`${API_BASE}/search/songs?query=${encodeURIComponent(query)}&limit=${limit}`, {
+        const response = await fetch(`${API_BASE}/search/songs?query=${encodeURIComponent(query)}&limit=${limit * 2}`, {
             headers: REQUEST_HEADERS
         });
         
-        // DEBUGGING TRICK 1: Catch HTTP errors and show them in the UI
-        if (!response.ok) {
-            return {
-                tracks: [{ id: 'err1', title: `HTTP Error: ${response.status}`, artist: 'Cloudflare blocked request?', duration: 0, audioQuality: 'HIGH' }],
-                total: 1
-            };
-        }
-        
+        if (!response.ok) return { tracks: [], total: 0 };
         const json = await response.json();
-        
-        // DEBUGGING TRICK 2: Catch missing data objects
-        if (!json.success || !json.data) {
-            return {
-                tracks: [{ id: 'err2', title: 'API Error: Missing data', artist: JSON.stringify(json).substring(0, 50), duration: 0, audioQuality: 'HIGH' }],
-                total: 1
-            };
-        }
+        if (!json.success || !json.data) return { tracks: [], total: 0 };
 
         const rawResults = json.data.results || json.data.songs || json.data || [];
-        
-        if (!Array.isArray(rawResults) || rawResults.length === 0) {
-            return {
-                tracks: [{ id: 'err3', title: 'No results found', artist: 'Try a different search term', duration: 0, audioQuality: 'HIGH' }],
-                total: 1
-            };
-        }
+        if (!Array.isArray(rawResults) || rawResults.length === 0) return { tracks: [], total: 0 };
 
-        const tracks = rawResults.map(song => {
-            // Highly robust image parsing
+        let tracks = rawResults.map((song, index) => {
             let bestImage = '';
             if (Array.isArray(song.image) && song.image.length > 0) {
                 bestImage = song.image[song.image.length - 1].url || song.image[song.image.length - 1].link || '';
@@ -57,13 +89,11 @@ async function searchTracks(query, limit = 20) {
                 bestImage = song.image;
             }
             
-            // Highly robust audio parsing
             let bestAudio = '';
             if (Array.isArray(song.downloadUrl) && song.downloadUrl.length > 0) {
                 bestAudio = song.downloadUrl[song.downloadUrl.length - 1].url || song.downloadUrl[song.downloadUrl.length - 1].link || '';
             }
 
-            // Highly robust artist parsing
             let artistName = 'Unknown Artist';
             if (typeof song.primaryArtists === 'string') {
                 artistName = song.primaryArtists;
@@ -71,29 +101,57 @@ async function searchTracks(query, limit = 20) {
                 artistName = song.primaryArtists.map(a => a.name).join(', ');
             }
 
-            // Trick: Combine the ID and the Audio URL to skip a second fetch when playing
+            const title = song.name || song.title || 'Unknown Title';
+            const duration = parseInt(song.duration) || 0;
             const compoundId = String(song.id) + '||' + bestAudio;
+
+            // Calculate Strict Scores
+            const relevance = queryRelevance(query, title, artistName);
+            const canon = canonicityScore(title);
+            
+            // JioSaavn's default API ranking carries weight
+            const sourceRank = Math.max(0, 1 - (index * 0.05)); 
+            
+            // Final sorting score
+            const finalScore = (relevance * 0.60) + (canon * 0.30) + (sourceRank * 0.10);
 
             return {
                 id: compoundId,
-                title: song.name || song.title || 'Unknown Title',
+                title: title,
                 artist: artistName,
                 album: (song.album && song.album.name) ? song.album.name : 'Unknown Album',
                 albumCover: bestImage,
-                duration: parseInt(song.duration) || 0,
-                audioQuality: 'HIGH'
+                duration: duration,
+                audioQuality: 'HIGH',
+                
+                // Keep these internal for sorting, 8SPINE won't render them
+                _relevance: relevance,
+                _score: finalScore
             };
         });
 
-        return { tracks, total: tracks.length };
+        // 1. Hard Filter: Drop tracks that are highly irrelevant to the search
+        tracks = tracks.filter(t => t._relevance > 0.15);
+        
+        // 2. Hard Filter: Drop crazy durations (likely podcasts or 10-hour mixes)
+        tracks = tracks.filter(t => t.duration > 30 && t.duration < 1200);
+
+        // 3. Sort by our strict scoring algorithm
+        tracks.sort((a, b) => b._score - a._score);
+
+        // 4. Return the top results up to the limit
+        const finalTracks = tracks.slice(0, limit);
+
+        return { tracks: finalTracks, total: finalTracks.length };
     } catch (error) {
-        // DEBUGGING TRICK 3: Catch JavaScript crashes and show the error message
-        return {
-            tracks: [{ id: 'err4', title: `Code Crash: ${error.message}`, artist: 'Check module syntax', duration: 0, audioQuality: 'HIGH' }],
-            total: 1
-        };
+        console.warn(LOG_PREFIX, 'Search error:', error);
+        return { tracks: [], total: 0 };
     }
 }
+
+// ---------------------------------------------------------------------------
+// Player Stream
+// ---------------------------------------------------------------------------
 
 async function getTrackStreamUrl(trackId, preferredQuality, context) {
     try {
@@ -115,16 +173,11 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
         }
 
         if (directUrl) {
-            // Force HTTPS to bypass Apple AVPlayer restrictions
             directUrl = directUrl.replace('http://', 'https://');
-            
             return {
                 streamUrl: directUrl,
                 streamType: 'mp4',
-                track: { 
-                    id: realId, 
-                    audioQuality: 'HIGH'
-                }
+                track: { id: realId, audioQuality: 'HIGH' }
             };
         }
         throw new Error('No audio URL found');
@@ -142,7 +195,7 @@ return {
     id: 'jiosaavn',
     name: 'JioSaavn',
     author: 'community',
-    version: '1.0.3',
+    version: '1.0.4',
     labels: ['JioSaavn', 'Bollywood', 'Audio'],
     description: 'Stream from JioSaavn via public API.',
     logo: 'https://upload.wikimedia.org/wikipedia/commons/3/35/JioSaavn-logo.png',
