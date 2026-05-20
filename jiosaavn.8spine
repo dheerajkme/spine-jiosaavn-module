@@ -7,16 +7,16 @@
  */
 
 const LOG_PREFIX = '[JioSaavn]';
-// Using the new Vercel deployment endpoint
 const API_BASE = 'https://saavnapi-nine.vercel.app'; 
 
+// Removed User-Agent as browsers/mobile fetch wrappers often block overriding it, 
+// and the Vercel deployment has permissive CORS anyway.
 const REQUEST_HEADERS = {
-    'Accept': 'application/json',
-    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
+    'Accept': 'application/json'
 };
 
 // ---------------------------------------------------------------------------
-// Matcher Helpers (Retained for future use)
+// Matcher Helpers (Used ONLY if "Strict Title Match" is enabled in settings)
 // ---------------------------------------------------------------------------
 function normalize(s) {
     if (!s) return '';
@@ -43,31 +43,11 @@ function similarity(a, b) {
     return (2 * hits) / (a.length + b.length - 2);
 }
 
-function queryRelevance(query, title, artist, album) {
+function queryRelevance(query, title, artist) {
     if (!query) return 0;
-    const qTokens = normalize(query).split(' ').filter(t => t.length > 1);
-    if (!qTokens.length) return 0;
-    const hay = normalize((title || '') + ' ' + (artist || '') + ' ' + (album || ''));
-    let hits = 0;
-    for (let i = 0; i < qTokens.length; i++) if (hay.includes(qTokens[i])) hits++;
-    let base = hits / qTokens.length;
-    if (hits < qTokens.length) base = base * 0.3; 
-    if (similarity(query, normalize(artist || '')) > 0.80) base = Math.min(1.3, base + 0.30);
-    if (similarity(query, normalize(title || '')) > 0.80) base = Math.min(1.3, base + 0.30);
-    return base;
-}
-
-function canonicityScore(title) {
-    if (!title) return 1.0;
-    const t = String(title).toLowerCase();
-    let score = 1.0;
-    if (/\(live[^)]*\)|\[live[^\]]*\]|\blive\b/i.test(t)) score -= 0.40;
-    if (/\binstrumental\b|\bkaraoke\b/i.test(t)) score -= 0.50;
-    if (/\bcover\b/i.test(t)) score -= 0.35;
-    if (/\bslowed\b|\bsped[\s-]?up\b|\bnightcore\b|\breverb\b|\b8d\b/i.test(t)) score -= 0.70;
-    if (/\bremix\b|\bmix\b/i.test(t)) score -= 0.10;
-    if (!/\(.+\)|\s[-\u2013\u2014]\s/.test(t)) score += 0.20;
-    return Math.max(0.10, Math.min(score, 1.30));
+    const titleSim = similarity(query, title);
+    const combinedSim = similarity(query, title + ' ' + artist);
+    return Math.max(titleSim, combinedSim);
 }
 
 // ---------------------------------------------------------------------------
@@ -106,7 +86,6 @@ function mapTrack(song) {
     const albumName = (song.album && song.album.name) ? song.album.name : (typeof song.album === 'string' ? song.album : 'Unknown Album');
     const albumId = (song.album && song.album.id) ? String(song.album.id) : null;
     
-    // Perma URL is usually best for Sumanjay fork stream resolving
     const rawId = song.perma_url || song.id || song.songid;
     const compoundId = String(rawId) + '||' + bestAudio;
 
@@ -128,15 +107,13 @@ function mapTrack(song) {
 // 8SPINE Core Functions
 // ---------------------------------------------------------------------------
 
-async function searchTracks(query, limit = 20) {
+async function searchTracks(query, limit = 20, context) {
     try {
-        // Switched endpoint to /result/?query=
         const response = await fetch(`${API_BASE}/result/?query=${encodeURIComponent(query)}&limit=${limit}`, { headers: REQUEST_HEADERS });
         if (!response.ok) return { tracks: [], total: 0 };
         
         const json = await response.json();
         
-        // Accept both response shapes
         let rawResults = [];
         if (Array.isArray(json)) {
             rawResults = json;
@@ -148,27 +125,18 @@ async function searchTracks(query, limit = 20) {
 
         if (!Array.isArray(rawResults) || rawResults.length === 0) return { tracks: [], total: 0 };
 
-        let tracks = rawResults.map((song, index) => {
-            const mapped = mapTrack(song);
-            
-            // Keep scoring calculations in memory just in case
-            const relevance = queryRelevance(query, mapped.title, mapped.artist, mapped.album);
-            const canon = canonicityScore(mapped.title);
-            const sourceRank = Math.max(0, 1 - (index * 0.05)); 
-            const popularityScore = Math.min(Math.log10(Math.max(1, mapped._playCount)) / 9, 1.0);
-            mapped._score = (relevance * 0.45) + (canon * 0.25) + (popularityScore * 0.20) + (sourceRank * 0.10);
-            
-            return mapped;
-        });
+        let tracks = rawResults.map(song => mapTrack(song));
 
-        /*
-        // ---------------------------------------------------------
-        // COMMENTED OUT: Strict duration filter and custom ranking
-        // We will trust the API's default ranking for now.
-        // ---------------------------------------------------------
-        tracks = tracks.filter(t => t.duration > 30 && t.duration < 1200);
-        tracks.sort((a, b) => b._score - a._score);
-        */
+        // Read the user's setting for search mode
+        const searchMode = (context && context.settings && context.settings.searchMode && context.settings.searchMode.value) || 'DEFAULT';
+
+        // Apply strict manual resorting ONLY if the user toggled it on
+        if (searchMode === 'STRICT') {
+            tracks.forEach(t => {
+                t._score = queryRelevance(query, t.title, t.artist);
+            });
+            tracks.sort((a, b) => b._score - a._score);
+        }
 
         const finalTracks = tracks.slice(0, limit);
         return { tracks: finalTracks, total: finalTracks.length };
@@ -185,7 +153,6 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
         let directUrl = parts.length > 1 ? parts[1] : null;
 
         if (!directUrl || directUrl === 'undefined' || directUrl === '') {
-            // Sumanjay API uses /song/?query= to resolve tracks
             const response = await fetch(`${API_BASE}/song/?query=${encodeURIComponent(realId)}`, { headers: REQUEST_HEADERS });
             if (!response.ok) throw new Error('HTTP ' + response.status);
             
@@ -214,7 +181,6 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
 }
 
 async function getAlbum(albumId) {
-    // Left empty/unsupported as /result/ forks often handle albums differently
     throw new Error('Album fetch not supported yet');
 }
 
@@ -234,7 +200,7 @@ return {
     id: 'jiosaavn-vercel',
     name: 'JioSaavn',
     author: 'community',
-    version: '1.1.0',
+    version: '1.1.1',
     labels: ['JioSaavn', 'Bollywood', 'Vercel API'],
     description: 'Stream from JioSaavn via direct API ordering.',
     logo: 'https://upload.wikimedia.org/wikipedia/commons/3/35/JioSaavn-logo.png',
@@ -248,6 +214,16 @@ return {
                 { label: 'High Quality', value: 'HIGH' }
             ],
             defaultValue: 'HIGH'
+        },
+        searchMode: {
+            type: 'selector',
+            label: 'Search Ranking',
+            description: 'Choose how search results are ordered',
+            options: [
+                { label: 'API Default (Recommended)', value: 'DEFAULT' },
+                { label: 'Strict Title Match', value: 'STRICT' }
+            ],
+            defaultValue: 'DEFAULT'
         }
     },
 
