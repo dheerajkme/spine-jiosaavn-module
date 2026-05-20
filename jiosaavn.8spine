@@ -7,36 +7,77 @@
  */
 
 const LOG_PREFIX = '[JioSaavn]';
-// Using a live, public JioSaavn API instance
 const API_BASE = 'https://saavn.sumit.co/api'; 
+
+// Standard browser headers to bypass Cloudflare bot protection
+const REQUEST_HEADERS = {
+    'Accept': 'application/json',
+    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
+};
 
 async function searchTracks(query, limit = 20) {
     try {
-        const response = await fetch(`${API_BASE}/search/songs?query=${encodeURIComponent(query)}&limit=${limit}`);
-        if (!response.ok) return { tracks: [], total: 0 };
+        const response = await fetch(`${API_BASE}/search/songs?query=${encodeURIComponent(query)}&limit=${limit}`, {
+            headers: REQUEST_HEADERS
+        });
+        
+        // DEBUGGING TRICK 1: Catch HTTP errors and show them in the UI
+        if (!response.ok) {
+            return {
+                tracks: [{ id: 'err1', title: `HTTP Error: ${response.status}`, artist: 'Cloudflare blocked request?', duration: 0, audioQuality: 'HIGH' }],
+                total: 1
+            };
+        }
         
         const json = await response.json();
         
-        // Sumit's API wraps data in success & data.results objects
-        if (!json.success || !json.data || !json.data.results) return { tracks: [], total: 0 };
+        // DEBUGGING TRICK 2: Catch missing data objects
+        if (!json.success || !json.data) {
+            return {
+                tracks: [{ id: 'err2', title: 'API Error: Missing data', artist: JSON.stringify(json).substring(0, 50), duration: 0, audioQuality: 'HIGH' }],
+                total: 1
+            };
+        }
 
-        const tracks = json.data.results.map(song => {
-            // Get highest quality image
-            const bestImage = song.image && song.image.length > 0 ? song.image[song.image.length - 1].url : '';
+        const rawResults = json.data.results || json.data.songs || json.data || [];
+        
+        if (!Array.isArray(rawResults) || rawResults.length === 0) {
+            return {
+                tracks: [{ id: 'err3', title: 'No results found', artist: 'Try a different search term', duration: 0, audioQuality: 'HIGH' }],
+                total: 1
+            };
+        }
+
+        const tracks = rawResults.map(song => {
+            // Highly robust image parsing
+            let bestImage = '';
+            if (Array.isArray(song.image) && song.image.length > 0) {
+                bestImage = song.image[song.image.length - 1].url || song.image[song.image.length - 1].link || '';
+            } else if (typeof song.image === 'string') {
+                bestImage = song.image;
+            }
             
-            // Get highest quality stream URL (usually 320kbps at the end of the array)
+            // Highly robust audio parsing
             let bestAudio = '';
-            if (song.downloadUrl && song.downloadUrl.length > 0) {
-                bestAudio = song.downloadUrl[song.downloadUrl.length - 1].url;
+            if (Array.isArray(song.downloadUrl) && song.downloadUrl.length > 0) {
+                bestAudio = song.downloadUrl[song.downloadUrl.length - 1].url || song.downloadUrl[song.downloadUrl.length - 1].link || '';
+            }
+
+            // Highly robust artist parsing
+            let artistName = 'Unknown Artist';
+            if (typeof song.primaryArtists === 'string') {
+                artistName = song.primaryArtists;
+            } else if (Array.isArray(song.primaryArtists)) {
+                artistName = song.primaryArtists.map(a => a.name).join(', ');
             }
 
             // Trick: Combine the ID and the Audio URL to skip a second fetch when playing
-            const compoundId = song.id + '||' + bestAudio;
+            const compoundId = String(song.id) + '||' + bestAudio;
 
             return {
                 id: compoundId,
-                title: song.name || 'Unknown Title',
-                artist: song.primaryArtists || 'Unknown Artist',
+                title: song.name || song.title || 'Unknown Title',
+                artist: artistName,
                 album: (song.album && song.album.name) ? song.album.name : 'Unknown Album',
                 albumCover: bestImage,
                 duration: parseInt(song.duration) || 0,
@@ -46,26 +87,29 @@ async function searchTracks(query, limit = 20) {
 
         return { tracks, total: tracks.length };
     } catch (error) {
-        console.warn(LOG_PREFIX, 'Search error:', error);
-        return { tracks: [], total: 0 }; 
+        // DEBUGGING TRICK 3: Catch JavaScript crashes and show the error message
+        return {
+            tracks: [{ id: 'err4', title: `Code Crash: ${error.message}`, artist: 'Check module syntax', duration: 0, audioQuality: 'HIGH' }],
+            total: 1
+        };
     }
 }
 
 async function getTrackStreamUrl(trackId, preferredQuality, context) {
     try {
-        // Extract the URL we hid inside the trackId
         const parts = String(trackId).split('||');
         const realId = parts[0];
         let directUrl = parts.length > 1 ? parts[1] : null;
 
-        // Fallback just in case the ID didn't have the URL attached
-        if (!directUrl || directUrl === 'undefined') {
-            const response = await fetch(`${API_BASE}/songs?id=${realId}`);
+        if (!directUrl || directUrl === 'undefined' || directUrl === '') {
+            const response = await fetch(`${API_BASE}/songs?id=${realId}`, { headers: REQUEST_HEADERS });
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+            
             const json = await response.json();
             if (json.success && json.data && json.data[0]) {
                 const song = json.data[0];
                 if (song.downloadUrl && song.downloadUrl.length > 0) {
-                    directUrl = song.downloadUrl[song.downloadUrl.length - 1].url;
+                    directUrl = song.downloadUrl[song.downloadUrl.length - 1].url || song.downloadUrl[song.downloadUrl.length - 1].link;
                 }
             }
         }
@@ -98,7 +142,7 @@ return {
     id: 'jiosaavn',
     name: 'JioSaavn',
     author: 'community',
-    version: '1.0.2',
+    version: '1.0.3',
     labels: ['JioSaavn', 'Bollywood', 'Audio'],
     description: 'Stream from JioSaavn via public API.',
     logo: 'https://upload.wikimedia.org/wikipedia/commons/3/35/JioSaavn-logo.png',
