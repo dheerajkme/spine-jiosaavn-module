@@ -7,90 +7,102 @@
  */
 
 const LOG_PREFIX = '[JioSaavn]';
-const API_BASE = 'https://cyberboysumanjay.github.io/JioSaavnAPI'; 
+// Using a live, public JioSaavn API instance
+const API_BASE = 'https://saavn.sumit.co/api'; 
 
-// ---------------------------------------------------------------------------
-// Search
-// ---------------------------------------------------------------------------
 async function searchTracks(query, limit = 20) {
     try {
-        const response = await fetch(`${API_BASE}/result/?query=${encodeURIComponent(query)}`);
+        const response = await fetch(`${API_BASE}/search/songs?query=${encodeURIComponent(query)}&limit=${limit}`);
         if (!response.ok) return { tracks: [], total: 0 };
         
-        const data = await response.json();
+        const json = await response.json();
         
-        let rawTracks = [];
-        if (Array.isArray(data)) rawTracks = data;
-        else if (data && data.songs) rawTracks = data.songs;
-        else if (typeof data === 'object') rawTracks = [data];
+        // Sumit's API wraps data in success & data.results objects
+        if (!json.success || !json.data || !json.data.results) return { tracks: [], total: 0 };
 
-        const tracks = rawTracks.slice(0, limit).map(song => ({
-            // CRITICAL: Force IDs to be Strings so 8SPINE doesn't crash
-            id: String(song.perma_url || song.id || song.songid),
-            title: song.title || song.song || 'Unknown Title',
-            artist: song.singers || song.primary_artists || 'Unknown Artist',
-            album: song.album || 'Unknown Album',
-            albumCover: song.image || song.image_url || '',
-            duration: parseInt(song.duration) || 0,
-            audioQuality: 'HIGH'
-        }));
+        const tracks = json.data.results.map(song => {
+            // Get highest quality image
+            const bestImage = song.image && song.image.length > 0 ? song.image[song.image.length - 1].url : '';
+            
+            // Get highest quality stream URL (usually 320kbps at the end of the array)
+            let bestAudio = '';
+            if (song.downloadUrl && song.downloadUrl.length > 0) {
+                bestAudio = song.downloadUrl[song.downloadUrl.length - 1].url;
+            }
+
+            // Trick: Combine the ID and the Audio URL to skip a second fetch when playing
+            const compoundId = song.id + '||' + bestAudio;
+
+            return {
+                id: compoundId,
+                title: song.name || 'Unknown Title',
+                artist: song.primaryArtists || 'Unknown Artist',
+                album: (song.album && song.album.name) ? song.album.name : 'Unknown Album',
+                albumCover: bestImage,
+                duration: parseInt(song.duration) || 0,
+                audioQuality: 'HIGH'
+            };
+        });
 
         return { tracks, total: tracks.length };
     } catch (error) {
         console.warn(LOG_PREFIX, 'Search error:', error);
-        return { tracks: [], total: 0 }; // Graceful fail, no UI freeze
+        return { tracks: [], total: 0 }; 
     }
 }
 
-// ---------------------------------------------------------------------------
-// Player Stream
-// ---------------------------------------------------------------------------
 async function getTrackStreamUrl(trackId, preferredQuality, context) {
     try {
-        const response = await fetch(`${API_BASE}/song/?query=${encodeURIComponent(trackId)}`);
-        if (!response.ok) throw new Error('HTTP ' + response.status);
-        
-        const data = await response.json();
-        const songData = Array.isArray(data) ? data[0] : data;
-        
-        const directUrl = songData.media_url || songData.url;
+        // Extract the URL we hid inside the trackId
+        const parts = String(trackId).split('||');
+        const realId = parts[0];
+        let directUrl = parts.length > 1 ? parts[1] : null;
+
+        // Fallback just in case the ID didn't have the URL attached
+        if (!directUrl || directUrl === 'undefined') {
+            const response = await fetch(`${API_BASE}/songs?id=${realId}`);
+            const json = await response.json();
+            if (json.success && json.data && json.data[0]) {
+                const song = json.data[0];
+                if (song.downloadUrl && song.downloadUrl.length > 0) {
+                    directUrl = song.downloadUrl[song.downloadUrl.length - 1].url;
+                }
+            }
+        }
 
         if (directUrl) {
+            // Force HTTPS to bypass Apple AVPlayer restrictions
+            directUrl = directUrl.replace('http://', 'https://');
+            
             return {
                 streamUrl: directUrl,
+                streamType: 'mp4',
                 track: { 
-                    id: String(trackId), 
+                    id: realId, 
                     audioQuality: 'HIGH'
                 }
             };
         }
-        throw new Error('No audio found');
+        throw new Error('No audio URL found');
     } catch (error) {
         console.warn(LOG_PREFIX, 'Stream error:', error);
-        throw error; // Let 8SPINE handle the stream failure natively
+        throw error;
     }
 }
 
-// ---------------------------------------------------------------------------
-// Album Fallback
-// ---------------------------------------------------------------------------
 async function getAlbum(albumId) {
-    throw new Error('Album fetch not supported');
+    throw new Error('Album fetch not supported yet');
 }
 
-// ---------------------------------------------------------------------------
-// Module export (Matching Jimmy's exact structure)
-// ---------------------------------------------------------------------------
 return {
     id: 'jiosaavn',
     name: 'JioSaavn',
     author: 'community',
-    version: '1.0.1',
+    version: '1.0.2',
     labels: ['JioSaavn', 'Bollywood', 'Audio'],
-    description: 'Stream from JioSaavn via custom API.',
+    description: 'Stream from JioSaavn via public API.',
     logo: 'https://upload.wikimedia.org/wikipedia/commons/3/35/JioSaavn-logo.png',
 
-    // Dummy settings to prevent UI crashes if the user opens the module settings
     settings: {
         quality: {
             type: 'selector',
