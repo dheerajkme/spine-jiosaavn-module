@@ -9,9 +9,14 @@
       "description": "Stream from JioSaavn via custom API.",
       "logo": "https://upload.wikimedia.org/wikipedia/commons/3/35/JioSaavn-logo.png",
       "labels": ["JioSaavn", "Bollywood", "Audio"],
-      "url": "https://dheerajkme.github.io/spine-jiosaavn-module/jiosaavn.js",
-      "moduleUrl": "https://dheerajkme.github.io/spine-jiosaavn-module/jiosaavn.js",
-      "source": "https://dheerajkme.github.io/spine-jiosaavn-module/jiosaavn.js"
+      
+      "url": "https://dheerajkme.github.io/spine-jiosaavn-module/jiosaavn.8spine",
+      "moduleUrl": "https://dheerajkme.github.io/spine-jiosaavn-module/jiosaavn.8spine",
+      "source": "https://dheerajkme.github.io/spine-jiosaavn-module/jiosaavn.8spine",
+      "file": "https://dheerajkme.github.io/spine-jiosaavn-module/jiosaavn.8spine",
+      "downloadUrl": "https://dheerajkme.github.io/spine-jiosaavn-module/jiosaavn.8spine",
+      "download": "https://dheerajkme.github.io/spine-jiosaavn-module/jiosaavn.8spine",
+      "path": "https://dheerajkme.github.io/spine-jiosaavn-module/jiosaavn.8spine"
     }
   ]
 }
