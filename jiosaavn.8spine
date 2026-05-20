@@ -9,6 +9,7 @@
 const LOG_PREFIX = '[JioSaavn]';
 const API_BASE = 'https://saavn.sumit.co/api'; 
 
+// Standard browser headers to bypass Cloudflare bot protection
 const REQUEST_HEADERS = {
     'Accept': 'application/json',
     'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
@@ -105,15 +106,17 @@ async function searchTracks(query, limit = 20) {
             const duration = parseInt(song.duration) || 0;
             const compoundId = String(song.id) + '||' + bestAudio;
 
-            // Calculate Strict Scores
+            // 1. Calculate Strict Scores
             const relevance = queryRelevance(query, title, artistName);
             const canon = canonicityScore(title);
-            
-            // JioSaavn's default API ranking carries weight
             const sourceRank = Math.max(0, 1 - (index * 0.05)); 
             
-            // Final sorting score
-            const finalScore = (relevance * 0.60) + (canon * 0.30) + (sourceRank * 0.10);
+            // 2. Calculate Popularity Score based on playCount (Logarithmic scale)
+            const playCount = parseInt(song.playCount) || parseInt(song.play_count) || 0;
+            const popularityScore = Math.min(Math.log10(Math.max(1, playCount)) / 9, 1.0);
+            
+            // 3. Final sorting score (Weights: Relevance 50%, Canon 25%, Popularity 15%, Source 10%)
+            const finalScore = (relevance * 0.50) + (canon * 0.25) + (popularityScore * 0.15) + (sourceRank * 0.10);
 
             return {
                 id: compoundId,
@@ -130,16 +133,16 @@ async function searchTracks(query, limit = 20) {
             };
         });
 
-        // 1. Hard Filter: Drop tracks that are highly irrelevant to the search
+        // Hard Filter: Drop tracks that are highly irrelevant to the search
         tracks = tracks.filter(t => t._relevance > 0.15);
         
-        // 2. Hard Filter: Drop crazy durations (likely podcasts or 10-hour mixes)
+        // Hard Filter: Drop crazy durations (likely podcasts or 10-hour mixes)
         tracks = tracks.filter(t => t.duration > 30 && t.duration < 1200);
 
-        // 3. Sort by our strict scoring algorithm
+        // Sort by our strict scoring algorithm
         tracks.sort((a, b) => b._score - a._score);
 
-        // 4. Return the top results up to the limit
+        // Return the top results up to the limit
         const finalTracks = tracks.slice(0, limit);
 
         return { tracks: finalTracks, total: finalTracks.length };
@@ -173,7 +176,9 @@ async function getTrackStreamUrl(trackId, preferredQuality, context) {
         }
 
         if (directUrl) {
+            // Force HTTPS to bypass Apple AVPlayer restrictions
             directUrl = directUrl.replace('http://', 'https://');
+            
             return {
                 streamUrl: directUrl,
                 streamType: 'mp4',
@@ -191,13 +196,17 @@ async function getAlbum(albumId) {
     throw new Error('Album fetch not supported yet');
 }
 
+// ---------------------------------------------------------------------------
+// Module export
+// ---------------------------------------------------------------------------
+
 return {
     id: 'jiosaavn',
     name: 'JioSaavn',
     author: 'community',
-    version: '1.0.4',
+    version: '1.0.5',
     labels: ['JioSaavn', 'Bollywood', 'Audio'],
-    description: 'Stream from JioSaavn via public API.',
+    description: 'Stream from JioSaavn via public API with smart sorting.',
     logo: 'https://upload.wikimedia.org/wikipedia/commons/3/35/JioSaavn-logo.png',
 
     settings: {
